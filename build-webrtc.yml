@@ -1,0 +1,517 @@
+name: Build APK WebRTC
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Gerar projeto
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "LowLatMirror"
+          include(":app")
+          EOF_FILE
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.lowlatmirror"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.lowlatmirror"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "0.2"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.activity:activity-ktx:1.9.0")
+              implementation("io.getstream:stream-webrtc-android:1.1.1")
+              implementation("org.java-websocket:Java-WebSocket:1.5.7")
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application android:label="LowLat Mirror" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".ScreenCaptureService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/lowlatmirror/MainActivity.kt)
+          cat > app/src/main/java/com/example/lowlatmirror/MainActivity.kt <<'EOF_FILE'
+          package com.example.lowlatmirror
+
+          import android.Manifest
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.widget.*
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import java.net.Inet4Address
+          import java.net.NetworkInterface
+
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var statsView: TextView
+              private lateinit var ipView: TextView
+              private val handler = Handler(Looper.getMainLooper())
+              private var lastFrames = 0L
+              private var lastBytes = 0L
+
+              private val captureLauncher =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+                      val data = res.data ?: return@registerForActivityResult
+                      startForegroundService(Intent(this, ScreenCaptureService::class.java).apply {
+                          action = ScreenCaptureService.ACTION_START
+                          putExtra(ScreenCaptureService.EXTRA_DATA, data)
+                      })
+                  }
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      ipView.text = "IP deste celular: ${localIp() ?: "sem Wi-Fi"}\nDigite esse IP no app da TV."
+                      val f = Stats.frames; val b = Stats.bytes
+                      val fps = if (f >= lastFrames) f - lastFrames else 0
+                      val mbps = if (b >= lastBytes) (b - lastBytes) * 8 / 1_000_000f else 0f
+                      lastFrames = f; lastBytes = b
+                      val enc = if (Stats.encodeMs >= 0) "${Stats.encodeMs} ms" else "—"
+                      val rtt = if (Stats.rttMs >= 0) "%.1f ms".format(Stats.rttMs) else "— (TV não conectada)"
+                      val est = if (Stats.encodeMs >= 0 && Stats.rttMs >= 0)
+                          "\nEstimado (sem decode/tela): %.0f ms".format(Stats.encodeMs + Stats.rttMs / 2) else ""
+                      statsView.text = "Codificação: $enc\nRede (ida e volta): $rtt$est\n$fps fps · %.1f Mbps".format(mbps)
+                      handler.postDelayed(this, 1000)
+                  }
+              }
+
+              private fun localIp(): String? {
+                  val addrs = NetworkInterface.getNetworkInterfaces().toList()
+                      .filter { it.isUp && !it.isLoopback }
+                      .sortedByDescending { it.name.startsWith("wlan") }
+                      .flatMap { it.inetAddresses.toList() }
+                      .filterIsInstance<Inet4Address>()
+                      .mapNotNull { it.hostAddress }
+                  return addrs.firstOrNull { it.startsWith("192.168.") || it.startsWith("10.") || it.startsWith("172.") }
+                      ?: addrs.firstOrNull()
+              }
+
+              override fun onResume() { super.onResume(); handler.post(tick) }
+              override fun onPause() { super.onPause(); handler.removeCallbacks(tick) }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+
+                  ipView = TextView(this).apply { textSize = 18f }
+                  val start = Button(this).apply {
+                      text = "Iniciar espelhamento"
+                      setOnClickListener {
+                          val mpm = getSystemService(MediaProjectionManager::class.java)
+                          captureLauncher.launch(mpm.createScreenCaptureIntent())
+                      }
+                  }
+                  val stop = Button(this).apply {
+                      text = "Parar"
+                      setOnClickListener {
+                          startService(Intent(this@MainActivity, ScreenCaptureService::class.java)
+                              .setAction(ScreenCaptureService.ACTION_STOP))
+                      }
+                  }
+                  statsView = TextView(this).apply { textSize = 16f; setPadding(0, 48, 0, 0) }
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                      addView(ipView); addView(start); addView(stop); addView(statsView)
+                  })
+              }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/lowlatmirror/ScreenCaptureService.kt)
+          cat > app/src/main/java/com/example/lowlatmirror/ScreenCaptureService.kt <<'EOF_FILE'
+          package com.example.lowlatmirror
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.IBinder
+
+          class ScreenCaptureService : Service() {
+
+              companion object {
+                  const val ACTION_START = "start"
+                  const val ACTION_STOP = "stop"
+                  const val EXTRA_DATA = "data"
+                  private const val CH = "mirror"
+              }
+
+              private var session: WebRtcSession? = null
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_START -> start(intent)
+                      ACTION_STOP -> { stopAll(); stopSelf() }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun start(intent: Intent) {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CH, "Espelhamento", NotificationManager.IMPORTANCE_LOW))
+                  val notif = Notification.Builder(this, CH)
+                      .setContentTitle("Espelhando a tela")
+                      .setSmallIcon(android.R.drawable.ic_menu_share)
+                      .build()
+                  // Android 14+: precisa estar em primeiro plano ANTES de capturar a tela
+                  startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+
+                  val data = intent.getParcelableExtra<Intent>(EXTRA_DATA) ?: return
+                  stopAll()
+                  Stats.reset()
+
+                  // lado maior = 1920, multiplos de 16
+                  val dm = resources.displayMetrics
+                  val scale = 1920f / maxOf(dm.widthPixels, dm.heightPixels)
+                  val w = ((dm.widthPixels * scale).toInt() / 16) * 16
+                  val h = ((dm.heightPixels * scale).toInt() / 16) * 16
+
+                  session = WebRtcSession(this, data, onStopped = { stopAll(); stopSelf() }).also {
+                      it.start(w, h, 60)
+                  }
+              }
+
+              private fun stopAll() { session?.close(); session = null }
+
+              override fun onDestroy() { stopAll(); super.onDestroy() }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/lowlatmirror/WebRtcSession.kt)
+          cat > app/src/main/java/com/example/lowlatmirror/WebRtcSession.kt <<'EOF_FILE'
+          package com.example.lowlatmirror
+
+          import android.content.Context
+          import android.content.Intent
+          import android.media.projection.MediaProjection
+          import org.java_websocket.WebSocket
+          import org.java_websocket.handshake.ClientHandshake
+          import org.java_websocket.server.WebSocketServer
+          import org.json.JSONObject
+          import org.webrtc.*
+          import java.net.InetSocketAddress
+          import java.nio.ByteBuffer
+          import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
+
+          /**
+           * Captura a tela (libwebrtc) e envia por WebRTC para a TV.
+           * Sinalização: servidor WebSocket na porta 8080; a TV conecta e manda {"type":"hello"}.
+           */
+          class WebRtcSession(
+              ctx: Context,
+              private val projectionData: Intent,
+              private val appCtx: Context = ctx.applicationContext,
+              private val onStopped: () -> Unit,
+          ) {
+              private val exec = Executors.newSingleThreadScheduledExecutor()
+              private val egl = EglBase.create()
+              private val factory: PeerConnectionFactory
+
+              private var capturer: ScreenCapturerAndroid? = null
+              private var helper: SurfaceTextureHelper? = null
+              private var source: VideoSource? = null
+              private var track: VideoTrack? = null
+
+              private var pc: PeerConnection? = null
+              private var dc: DataChannel? = null
+              private var server: SignalingServer? = null
+
+              private var remoteSet = false
+              private val pendingRemoteIce = ArrayList<IceCandidate>()
+              private val pendingLocalIce = ArrayList<IceCandidate>()
+              private var answered = false
+
+              private var lastEncTime = 0.0
+              private var lastEncFrames = 0L
+
+              init {
+                  PeerConnectionFactory.initialize(
+                      PeerConnectionFactory.InitializationOptions.builder(appCtx).createInitializationOptions()
+                  )
+                  factory = PeerConnectionFactory.builder()
+                      .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, false))
+                      .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext))
+                      .createPeerConnectionFactory()
+              }
+
+              fun start(width: Int, height: Int, fps: Int) {
+                  capturer = ScreenCapturerAndroid(projectionData, object : MediaProjection.Callback() {
+                      override fun onStop() { onStopped() }
+                  })
+                  helper = SurfaceTextureHelper.create("capture", egl.eglBaseContext)
+                  source = factory.createVideoSource(true)          // true = conteudo de tela
+                  capturer!!.initialize(helper, appCtx, source!!.capturerObserver)
+                  capturer!!.startCapture(width, height, fps)
+                  track = factory.createVideoTrack("screen", source)
+
+                  server = SignalingServer(8080).also { it.start() }
+                  exec.scheduleAtFixedRate({ runCatching { tick() } }, 1, 1, TimeUnit.SECONDS)
+              }
+
+              // ---------------- sinalizacao ----------------
+              private inner class SignalingServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
+                  @Volatile var client: WebSocket? = null
+                  init { setReuseAddr(true); setConnectionLostTimeout(5) }
+
+                  override fun onOpen(conn: WebSocket, hs: ClientHandshake) {
+                      client?.close(); client = conn
+                  }
+                  override fun onClose(conn: WebSocket, code: Int, reason: String?, remote: Boolean) {
+                      if (conn === client) { client = null; exec.execute { closePc() } }
+                  }
+                  override fun onMessage(conn: WebSocket, msg: String) {
+                      exec.execute { runCatching { handle(JSONObject(msg)) } }
+                  }
+                  override fun onError(conn: WebSocket?, ex: Exception?) {}
+                  override fun onStart() {}
+              }
+
+              private fun sendWs(o: JSONObject) { server?.client?.send(o.toString()) }
+
+              private fun handle(m: JSONObject) {
+                  when (m.getString("type")) {
+                      "hello" -> startOffer()
+                      "answer" -> {
+                          val p = pc ?: return
+                          p.setRemoteDescription(object : SdpAdapter() {
+                              override fun onSetSuccess() {
+                                  exec.execute {
+                                      remoteSet = true
+                                      pendingRemoteIce.forEach { pc?.addIceCandidate(it) }
+                                      pendingRemoteIce.clear()
+                                      tuneSender()
+                                      // So agora a TV ja aceitou a oferta: libera nossos candidatos
+                                      answered = true
+                                      pendingLocalIce.forEach { sendIce(it) }
+                                      pendingLocalIce.clear()
+                                  }
+                              }
+                          }, SessionDescription(SessionDescription.Type.ANSWER, m.getString("sdp")))
+                      }
+                      "ice" -> {
+                          val c = m.getJSONObject("candidate")
+                          val ic = IceCandidate(c.optString("sdpMid", "0"), c.optInt("sdpMLineIndex", 0), c.getString("candidate"))
+                          if (remoteSet) pc?.addIceCandidate(ic) else pendingRemoteIce.add(ic)
+                      }
+                  }
+              }
+
+              private fun sendIce(c: IceCandidate) {
+                  sendWs(JSONObject().put("type", "ice").put("candidate",
+                      JSONObject().put("candidate", c.sdp).put("sdpMid", c.sdpMid).put("sdpMLineIndex", c.sdpMLineIndex)))
+              }
+
+              // ---------------- conexao ----------------
+              private fun startOffer() {
+                  closePc()
+                  val cfg = PeerConnection.RTCConfiguration(emptyList()).apply {
+                      sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                      continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+                  }
+                  val p = factory.createPeerConnection(cfg, object : PeerConnection.Observer {
+                      override fun onIceCandidate(c: IceCandidate) {
+                          exec.execute { if (answered) sendIce(c) else pendingLocalIce.add(c) }
+                      }
+                      override fun onSignalingChange(s: PeerConnection.SignalingState?) {}
+                      override fun onIceConnectionChange(s: PeerConnection.IceConnectionState?) {}
+                      override fun onIceConnectionReceivingChange(b: Boolean) {}
+                      override fun onIceGatheringChange(s: PeerConnection.IceGatheringState?) {}
+                      override fun onIceCandidatesRemoved(c: Array<out IceCandidate>?) {}
+                      override fun onAddStream(s: MediaStream?) {}
+                      override fun onRemoveStream(s: MediaStream?) {}
+                      override fun onDataChannel(d: DataChannel?) {}
+                      override fun onRenegotiationNeeded() {}
+                      override fun onAddTrack(r: RtpReceiver?, s: Array<out MediaStream>?) {}
+                  }) ?: return
+                  pc = p
+                  remoteSet = false; answered = false
+                  pendingRemoteIce.clear(); pendingLocalIce.clear()
+                  lastEncTime = 0.0; lastEncFrames = 0
+
+                  p.addTrack(track, listOf("stream"))
+
+                  val init = DataChannel.Init().apply { ordered = false; maxRetransmits = 0 }
+                  dc = p.createDataChannel("ping", init)
+                  dc?.registerObserver(object : DataChannel.Observer {
+                      override fun onBufferedAmountChange(l: Long) {}
+                      override fun onStateChange() {}
+                      override fun onMessage(b: DataChannel.Buffer) {
+                          if (b.data.remaining() >= 8) {
+                              val t0 = b.data.getLong(b.data.position())
+                              Stats.rttMs = (System.nanoTime() - t0) / 1_000_000f
+                          }
+                      }
+                  })
+
+                  p.createOffer(object : SdpAdapter() {
+                      override fun onCreateSuccess(d: SessionDescription) {
+                          val sdp = preferH264(d.description)
+                          val offer = SessionDescription(SessionDescription.Type.OFFER, sdp)
+                          p.setLocalDescription(SdpAdapter(), offer)
+                          sendWs(JSONObject().put("type", "offer").put("sdp", sdp))
+                      }
+                  }, MediaConstraints())
+              }
+
+              private fun closePc() {
+                  remoteSet = false; answered = false
+                  runCatching { dc?.close(); dc?.dispose() }; dc = null
+                  runCatching { pc?.close(); pc?.dispose() }; pc = null
+                  Stats.rttMs = -1f
+              }
+
+              private fun tuneSender() {
+                  val s = pc?.senders?.firstOrNull { it.track()?.kind() == "video" } ?: return
+                  val p = s.parameters
+                  p.encodings.forEach { it.maxBitrateBps = 15_000_000; it.maxFramerate = 60 }
+                  p.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
+                  s.setParameters(p)
+              }
+
+              /** Poe H.264 na frente da lista de codecs (menor latencia, hardware dos dois lados). */
+              private fun preferH264(sdp: String): String {
+                  val lines = sdp.split("\r\n").toMutableList()
+                  val mi = lines.indexOfFirst { it.startsWith("m=video") }
+                  if (mi < 0) return sdp
+                  val h264 = lines.filter { it.startsWith("a=rtpmap:") && it.contains(" H264/90000") }
+                      .map { it.substringAfter("a=rtpmap:").substringBefore(" ") }
+                  if (h264.isEmpty()) return sdp
+                  val parts = lines[mi].split(" ")
+                  val pts = parts.drop(3)
+                  lines[mi] = (parts.take(3) + h264.filter { it in pts } + pts.filter { it !in h264 }).joinToString(" ")
+                  return lines.joinToString("\r\n")
+              }
+
+              // ---------------- metricas ----------------
+              private fun tick() {
+                  val p = pc ?: return
+                  // ping de RTT pelo canal de dados
+                  val ch = dc
+                  if (ch != null && ch.state() == DataChannel.State.OPEN) {
+                      val bb = ByteBuffer.allocate(8).putLong(System.nanoTime()); bb.flip()
+                      ch.send(DataChannel.Buffer(bb, true))
+                  }
+                  p.getStats { report ->
+                      report.statsMap.values.forEach { st ->
+                          if (st.type == "outbound-rtp" && st.members["kind"] == "video") {
+                              val frames = (st.members["framesEncoded"] as? Number)?.toLong() ?: return@forEach
+                              val encT = (st.members["totalEncodeTime"] as? Number)?.toDouble() ?: 0.0
+                              val bytes = (st.members["bytesSent"] as? Number)?.toLong() ?: 0L
+                              val df = frames - lastEncFrames
+                              if (df > 0 && lastEncFrames > 0) Stats.encodeMs = ((encT - lastEncTime) * 1000.0 / df).toInt()
+                              lastEncFrames = frames; lastEncTime = encT
+                              Stats.frames = frames; Stats.bytes = bytes
+                          }
+                      }
+                  }
+              }
+
+              fun close() {
+                  exec.shutdownNow()
+                  closePc()
+                  runCatching { server?.stop(300) }
+                  runCatching { capturer?.stopCapture() }
+                  runCatching { capturer?.dispose() }
+                  runCatching { helper?.dispose() }
+                  runCatching { track?.dispose() }
+                  runCatching { source?.dispose() }
+                  runCatching { factory.dispose() }
+                  runCatching { egl.release() }
+              }
+
+              private open class SdpAdapter : SdpObserver {
+                  override fun onCreateSuccess(d: SessionDescription) {}
+                  override fun onSetSuccess() {}
+                  override fun onCreateFailure(e: String?) {}
+                  override fun onSetFailure(e: String?) {}
+              }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/lowlatmirror/Stats.kt)
+          cat > app/src/main/java/com/example/lowlatmirror/Stats.kt <<'EOF_FILE'
+          package com.example.lowlatmirror
+
+          /** Métricas ao vivo, lidas pela tela principal. */
+          object Stats {
+              @Volatile var encodeMs = -1      // captura -> frame codificado (aprox.)
+              @Volatile var rttMs = -1f        // ida e volta até o receptor (-1 = sem resposta)
+              @Volatile var frames = 0L
+              @Volatile var bytes = 0L
+
+              fun reset() { encodeMs = -1; rttMs = -1f; frames = 0; bytes = 0 }
+          }
+          EOF_FILE
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LowLatMirror-WebRTC-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
