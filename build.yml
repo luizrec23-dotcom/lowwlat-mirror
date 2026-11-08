@@ -1,0 +1,463 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Gerar projeto
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "LowLatMirror"
+          include(":app")
+          EOF_FILE
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.lowlatmirror"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.lowlatmirror"
+                  minSdk = 29          // KEY_MAX_B_FRAMES; low-latency completo a partir do 30
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.activity:activity-ktx:1.9.0")
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application android:label="LowLat Mirror" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".ScreenCaptureService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/lowlatmirror/MainActivity.kt)
+          cat > app/src/main/java/com/example/lowlatmirror/MainActivity.kt <<'EOF_FILE'
+          package com.example.lowlatmirror
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.widget.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.activity.ComponentActivity
+
+          /** UI mínima, feita em código (sem XML). */
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var ipField: EditText
+              private lateinit var statsView: TextView
+              private val handler = Handler(Looper.getMainLooper())
+              private var lastFrames = 0L
+              private var lastBytes = 0L
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      val f = Stats.frames; val b = Stats.bytes
+                      val fps = f - lastFrames
+                      val mbps = (b - lastBytes) * 8 / 1_000_000f
+                      lastFrames = f; lastBytes = b
+                      val enc = if (Stats.encodeMs >= 0) "${Stats.encodeMs} ms" else "—"
+                      val rtt = if (Stats.rttMs >= 0) "%.1f ms".format(Stats.rttMs) else "— (sem resposta do receptor)"
+                      val est = if (Stats.encodeMs >= 0 && Stats.rttMs >= 0)
+                          "\nEstimado (sem decode/tela): %.0f ms".format(Stats.encodeMs + Stats.rttMs / 2) else ""
+                      statsView.text = "Codificação: $enc\nRede (ida e volta): $rtt$est\n$fps fps · %.1f Mbps".format(mbps)
+                      handler.postDelayed(this, 1000)
+                  }
+              }
+
+              override fun onResume() { super.onResume(); handler.post(tick) }
+              override fun onPause() { super.onPause(); handler.removeCallbacks(tick) }
+
+              private val captureLauncher =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+                      val data = res.data ?: return@registerForActivityResult
+                      val i = Intent(this, ScreenCaptureService::class.java).apply {
+                          action = ScreenCaptureService.ACTION_START
+                          putExtra(ScreenCaptureService.EXTRA_CODE, res.resultCode)
+                          putExtra(ScreenCaptureService.EXTRA_DATA, data)
+                          putExtra(ScreenCaptureService.EXTRA_HOST, ipField.text.toString().trim())
+                      }
+                      startForegroundService(i)
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+
+                  val prefs = getSharedPreferences("cfg", Context.MODE_PRIVATE)
+                  ipField = EditText(this).apply {
+                      hint = "IP do receptor (ex: 192.168.0.50)"
+                      setText(prefs.getString("host", ""))
+                  }
+                  val start = Button(this).apply {
+                      text = "Iniciar espelhamento"
+                      setOnClickListener {
+                          prefs.edit().putString("host", ipField.text.toString()).apply()
+                          val mpm = getSystemService(MediaProjectionManager::class.java)
+                          captureLauncher.launch(mpm.createScreenCaptureIntent())
+                      }
+                  }
+                  val stop = Button(this).apply {
+                      text = "Parar"
+                      setOnClickListener {
+                          startService(Intent(this@MainActivity, ScreenCaptureService::class.java)
+                              .setAction(ScreenCaptureService.ACTION_STOP))
+                      }
+                  }
+                  statsView = TextView(this).apply { textSize = 16f; setPadding(0, 48, 0, 0) }
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                      addView(ipField); addView(start); addView(stop); addView(statsView)
+                  })
+              }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/lowlatmirror/ScreenCaptureService.kt)
+          cat > app/src/main/java/com/example/lowlatmirror/ScreenCaptureService.kt <<'EOF_FILE'
+          package com.example.lowlatmirror
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.IBinder
+          import kotlin.concurrent.thread
+
+          class ScreenCaptureService : Service() {
+
+              companion object {
+                  const val ACTION_START = "start"
+                  const val ACTION_STOP = "stop"
+                  const val EXTRA_CODE = "code"
+                  const val EXTRA_DATA = "data"
+                  const val EXTRA_HOST = "host"
+                  private const val CH = "mirror"
+              }
+
+              private var projection: MediaProjection? = null
+              private var display: VirtualDisplay? = null
+              private var encoder: VideoEncoder? = null
+              private var sink: UdpSink? = null
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_START -> start(intent)
+                      ACTION_STOP -> { stopAll(); stopSelf() }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun start(intent: Intent) {
+                  // Android 14+: startForeground com o tipo mediaProjection ANTES de getMediaProjection
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CH, "Espelhamento", NotificationManager.IMPORTANCE_LOW))
+                  val notif = Notification.Builder(this, CH)
+                      .setContentTitle("Espelhando a tela")
+                      .setSmallIcon(android.R.drawable.ic_menu_share)
+                      .build()
+                  startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+
+                  val code = intent.getIntExtra(EXTRA_CODE, 0)
+                  val data = intent.getParcelableExtra<Intent>(EXTRA_DATA) ?: return
+                  val host = intent.getStringExtra(EXTRA_HOST) ?: return
+
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projection = mpm.getMediaProjection(code, data).apply {
+                      registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() { stopAll(); stopSelf() }
+                      }, null)
+                  }
+
+                  // Resolução: lado maior = 1920, múltiplos de 16 (preferido pelos encoders)
+                  val dm = resources.displayMetrics
+                  val scale = 1920f / maxOf(dm.widthPixels, dm.heightPixels)
+                  val w = ((dm.widthPixels * scale).toInt() / 16) * 16
+                  val h = ((dm.heightPixels * scale).toInt() / 16) * 16
+
+                  Stats.reset()
+                  thread { // socket não pode ser criado na main thread
+                      sink = UdpSink(host)
+                      encoder = VideoEncoder(w, h, fps = 60, bitrate = 15_000_000, sink = sink!!).also {
+                          it.start()
+                          display = projection!!.createVirtualDisplay(
+                              "mirror", w, h, dm.densityDpi,
+                              DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                              it.inputSurface, null, null
+                          )
+                      }
+                  }
+              }
+
+              private fun stopAll() {
+                  display?.release(); display = null
+                  encoder?.stop(); encoder = null
+                  sink?.close(); sink = null
+                  projection?.stop(); projection = null
+              }
+
+              override fun onDestroy() { stopAll(); super.onDestroy() }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/lowlatmirror/VideoEncoder.kt)
+          cat > app/src/main/java/com/example/lowlatmirror/VideoEncoder.kt <<'EOF_FILE'
+          package com.example.lowlatmirror
+
+          import android.media.MediaCodec
+          import android.media.MediaCodecInfo
+          import android.media.MediaFormat
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Process
+          import android.view.Surface
+
+          /** Recebe cada frame H.264 já codificado. */
+          fun interface EncodedFrameSink {
+              fun onFrame(data: ByteArray, ptsUs: Long, keyFrame: Boolean)
+          }
+
+          /**
+           * Encoder H.264 por hardware, ajustado para latência mínima.
+           * Os frames entram direto pela [inputSurface] (zero cópia a partir do VirtualDisplay).
+           */
+          class VideoEncoder(
+              private val width: Int,
+              private val height: Int,
+              private val fps: Int = 60,
+              private var bitrate: Int = 15_000_000,
+              private val sink: EncodedFrameSink,
+          ) {
+              private lateinit var codec: MediaCodec
+              lateinit var inputSurface: Surface
+                  private set
+              @Volatile private var running = false
+              private var thread: Thread? = null
+
+              fun start() {
+                  val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                      setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                      setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                      setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                      setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)           // keyframe a cada 1 s
+                      setInteger(MediaFormat.KEY_BITRATE_MODE,
+                          MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+                      // Baseline = sem B-frames, decodificação mais rápida na TV
+                      setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                      setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel42)
+                      setInteger("prepend-sps-pps-to-idr-frames", 1)
+                      // Repete o último frame se a tela estiver parada (evita "congelar" o decoder)
+                      setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+                      setInteger(MediaFormat.KEY_PRIORITY, 0)                   // tempo real
+                      if (Build.VERSION.SDK_INT >= 30) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                      if (Build.VERSION.SDK_INT >= 29) setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                  }
+                  codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                  codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                  inputSurface = codec.createInputSurface()
+                  codec.start()
+
+                  running = true
+                  thread = Thread({
+                      Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+                      drain()
+                  }, "encoder-drain").also { it.start() }
+              }
+
+              private fun drain() {
+                  val info = MediaCodec.BufferInfo()
+                  while (running) {
+                      val idx = try { codec.dequeueOutputBuffer(info, 10_000) } catch (e: Exception) { break }
+                      if (idx < 0) continue
+                      if (info.size > 0 && (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                          val buf = codec.getOutputBuffer(idx)!!
+                          buf.position(info.offset); buf.limit(info.offset + info.size)
+                          val out = ByteArray(info.size)
+                          buf.get(out)
+                          val lat = (System.nanoTime() / 1000 - info.presentationTimeUs) / 1000
+                          Stats.encodeMs = if (lat in 0..2000) lat.toInt() else -1
+                          Stats.frames++
+                          Stats.bytes += info.size
+                          sink.onFrame(out, info.presentationTimeUs,
+                              (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0)
+                      }
+                      codec.releaseOutputBuffer(idx, false)
+                  }
+              }
+
+              /** Ajuste de bitrate em tempo real (use com feedback de rede). */
+              fun setBitrate(bps: Int) {
+                  bitrate = bps
+                  codec.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, bps) })
+              }
+
+              /** Pede um keyframe imediato (ex.: o receptor perdeu pacotes). */
+              fun requestKeyFrame() {
+                  codec.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
+              }
+
+              fun stop() {
+                  running = false
+                  thread?.join(500)
+                  runCatching { codec.stop() }
+                  runCatching { codec.release() }
+                  runCatching { inputSurface.release() }
+              }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/lowlatmirror/UdpSink.kt)
+          cat > app/src/main/java/com/example/lowlatmirror/UdpSink.kt <<'EOF_FILE'
+          package com.example.lowlatmirror
+
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.nio.ByteBuffer
+
+          /**
+           * Transporte de TESTE: fragmenta cada frame em pacotes UDP.
+           * Cabeçalho (17 bytes): frameId u32 | fragIdx u16 | fragCount u16 | ptsUs i64 | flags u8 (1=keyframe)
+           *
+           * ATENÇÃO: apps web Tizen não abrem sockets UDP. Esta classe serve para validar
+           * captura/encoder (ex.: receptor no PC). Para a TV, troque por um sink WebRTC.
+           */
+          class UdpSink(host: String, port: Int = 5000) : EncodedFrameSink {
+              private val socket = DatagramSocket().apply { trafficClass = 0xB8 /* DSCP EF */ }
+              private val addr = InetAddress.getByName(host)
+              private val port = port
+              private var frameId = 0
+              private val maxPayload = 1200
+              private val buf = ByteArray(17 + maxPayload)
+
+              override fun onFrame(data: ByteArray, ptsUs: Long, keyFrame: Boolean) {
+                  val count = (data.size + maxPayload - 1) / maxPayload
+                  for (i in 0 until count) {
+                      val off = i * maxPayload
+                      val len = minOf(maxPayload, data.size - off)
+                      val bb = ByteBuffer.wrap(buf)
+                      bb.putInt(frameId).putShort(i.toShort()).putShort(count.toShort())
+                          .putLong(ptsUs).put(if (keyFrame) 1 else 0)
+                      System.arraycopy(data, off, buf, 17, len)
+                      socket.send(DatagramPacket(buf, 17 + len, addr, port))
+                  }
+                  frameId++
+              }
+
+              @Volatile private var alive = true
+              private val pingSocket = DatagramSocket().apply { soTimeout = 500 }
+
+              init {
+                  Thread({
+                      val out = ByteArray(8)
+                      val inp = ByteArray(8)
+                      while (alive) {
+                          try {
+                              val t0 = System.nanoTime()
+                              ByteBuffer.wrap(out).putLong(t0)
+                              pingSocket.send(DatagramPacket(out, 8, addr, 5001))
+                              pingSocket.receive(DatagramPacket(inp, 8))
+                              val sent = ByteBuffer.wrap(inp).getLong()
+                              Stats.rttMs = (System.nanoTime() - sent) / 1_000_000f
+                          } catch (e: java.net.SocketTimeoutException) {
+                              Stats.rttMs = -1f
+                          } catch (e: Exception) {
+                              if (!alive) break
+                          }
+                          try { Thread.sleep(1000) } catch (_: InterruptedException) { break }
+                      }
+                  }, "ping").start()
+              }
+
+              fun close() { alive = false; socket.close(); pingSocket.close() }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/lowlatmirror/Stats.kt)
+          cat > app/src/main/java/com/example/lowlatmirror/Stats.kt <<'EOF_FILE'
+          package com.example.lowlatmirror
+
+          /** Métricas ao vivo, lidas pela tela principal. */
+          object Stats {
+              @Volatile var encodeMs = -1      // captura -> frame codificado (aprox.)
+              @Volatile var rttMs = -1f        // ida e volta até o receptor (-1 = sem resposta)
+              @Volatile var frames = 0L
+              @Volatile var bytes = 0L
+
+              fun reset() { encodeMs = -1; rttMs = -1f; frames = 0; bytes = 0 }
+          }
+          EOF_FILE
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LowLatMirror-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
